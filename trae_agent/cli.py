@@ -189,6 +189,12 @@ def cli():
     help="Type of agent to use (trae_agent)",
     default="trae_agent",
 )
+@click.option(
+    "--extract-memory",
+    is_flag=True,
+    default=False,
+    help="Extract long-term memory after task execution",
+)
 def run(
     task: str | None,
     file_path: str | None,
@@ -204,6 +210,7 @@ def run(
     trajectory_file: str | None = None,
     console_type: str | None = "simple",
     agent_type: str | None = "trae_agent",
+    extract_memory: bool = False,
     # --- Add Docker Mode ---
     docker_image: str | None = None,
     docker_container_id: str | None = None,
@@ -382,6 +389,14 @@ def run(
         _ = asyncio.run(agent.run(task, task_args))
 
         console.print(f"\n[green]Trajectory saved to: {agent.trajectory_file}[/green]")
+
+        # Extract long-term memory if requested
+        if extract_memory and agent.agent.long_term_memory:
+            memory_path = asyncio.run(agent.agent.extract_memory_now())
+            if memory_path:
+                console.print(f"[cyan]Long-term memory saved to: {memory_path}[/cyan]")
+            else:
+                console.print("[yellow]No memory could be extracted from this execution.[/yellow]")
 
     except KeyboardInterrupt:
         console.print("\n[yellow]Task execution interrupted by user[/yellow]")
@@ -720,6 +735,144 @@ def tools():
             tools_table.add_row(tool_name, f"[red]Error loading: {e}[/red]")
 
     console.print(tools_table)
+
+
+@cli.command()
+@click.option(
+    "--trajectory-file",
+    "-t",
+    required=True,
+    help="Path to a trajectory JSON file to extract memory from",
+)
+@click.option(
+    "--output-dir",
+    "-o",
+    default="memory/",
+    help="Output directory for the memory Markdown file",
+)
+@click.option(
+    "--config-file",
+    help="Path to configuration file (for model settings)",
+    default="trae_config.yaml",
+    envvar="TRAE_CONFIG_FILE",
+)
+def memory(
+    trajectory_file: str,
+    output_dir: str,
+    config_file: str,
+):
+    """Extract long-term memory from a trajectory file."""
+    import json
+
+    from trae_agent.agent.agent_basics import AgentStep, AgentStepState
+    from trae_agent.tools.base import ToolCall, ToolResult
+    from trae_agent.utils.llm_clients.llm_basics import LLMResponse, LLMUsage
+    from trae_agent.utils.long_term_memory import LongTermMemory
+
+    # Load trajectory JSON
+    traj_path = Path(trajectory_file)
+    if not traj_path.exists():
+        console.print(f"[red]Error: Trajectory file not found: {traj_path}[/red]")
+        sys.exit(1)
+
+    with open(traj_path, "r", encoding="utf-8") as f:
+        traj_data = json.load(f)
+
+    # Rebuild AgentStep objects from trajectory data
+    steps: list[AgentStep] = []
+    for step_data in traj_data.get("agent_steps", []):
+        llm_response = None
+        resp_data = step_data.get("llm_response")
+        if resp_data:
+            usage = None
+            usage_data = resp_data.get("usage")
+            if usage_data:
+                usage = LLMUsage(
+                    input_tokens=usage_data.get("input_tokens", 0),
+                    output_tokens=usage_data.get("output_tokens", 0),
+                )
+            tool_calls = None
+            tc_data = resp_data.get("tool_calls")
+            if tc_data:
+                tool_calls = [
+                    ToolCall(
+                        call_id=tc.get("call_id", ""),
+                        name=tc.get("name", ""),
+                        arguments=tc.get("arguments", {}),
+                    )
+                    for tc in tc_data
+                ]
+            llm_response = LLMResponse(
+                content=resp_data.get("content", ""),
+                model=resp_data.get("model", ""),
+                finish_reason=resp_data.get("finish_reason"),
+                usage=usage,
+                tool_calls=tool_calls,
+            )
+
+        tool_results = None
+        tr_data = step_data.get("tool_results")
+        if tr_data:
+            tool_results = [
+                ToolResult(
+                    call_id=tr.get("call_id", ""),
+                    name=tr.get("name", ""),
+                    success=tr.get("success", False),
+                    result=tr.get("result"),
+                    error=tr.get("error"),
+                )
+                for tr in tr_data
+            ]
+
+        step = AgentStep(
+            step_number=step_data.get("step_number", 0),
+            state=AgentStepState(step_data.get("state", "completed")),
+            llm_response=llm_response,
+            tool_results=tool_results,
+            reflection=step_data.get("reflection"),
+            error=step_data.get("error"),
+        )
+        steps.append(step)
+
+    if not steps:
+        console.print("[yellow]No agent steps found in the trajectory file.[/yellow]")
+        sys.exit(1)
+
+    # Load config for model settings
+    config_file = resolve_config_file(config_file)
+    try:
+        config = Config.create(config_file=config_file)
+        fallback_model = config.trae_agent.model if config.trae_agent else None
+    except Exception:
+        fallback_model = None
+
+    if not fallback_model:
+        console.print("[red]Error: No model configuration found. Check your config file.[/red]")
+        sys.exit(1)
+
+    # Create LongTermMemory and extract
+    from trae_agent.utils.config import LongTermMemoryConfig
+
+    ltm_config = LongTermMemoryConfig(
+        enabled=True,
+        output_dir=output_dir,
+        model=fallback_model,
+    )
+    ltm = LongTermMemory(config=ltm_config, fallback_model=fallback_model)
+    ltm.set_task(traj_data.get("task", "Unknown"))
+
+    console.print(f"[blue]Extracting memory from {len(steps)} steps...[/blue]")
+
+    memory_path = asyncio.run(ltm.extract_and_save(steps))
+    if memory_path:
+        console.print(f"[green]Long-term memory saved to: {memory_path}[/green]")
+        # Print preview
+        md_content = Path(memory_path).read_text(encoding="utf-8")
+        from rich.markdown import Markdown as RichMarkdown
+
+        console.print(Panel(RichMarkdown(md_content), title="Memory Preview", border_style="cyan"))
+    else:
+        console.print("[yellow]No memory could be extracted from this trajectory.[/yellow]")
 
 
 def main():

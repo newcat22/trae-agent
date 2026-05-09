@@ -56,6 +56,16 @@ class Agent:
 
         self.agent.set_trajectory_recorder(self.trajectory_recorder)
 
+        # Set up long-term memory
+        if config.trae_agent and config.trae_agent.long_term_memory and config.trae_agent.long_term_memory.enabled:
+            from trae_agent.utils.long_term_memory import LongTermMemory
+
+            ltm = LongTermMemory(
+                config=config.trae_agent.long_term_memory,
+                fallback_model=config.trae_agent.model,
+            )
+            self.agent.set_long_term_memory(ltm)
+
     async def run(
         self,
         task: str,
@@ -63,6 +73,9 @@ class Agent:
         tool_names: list[str] | None = None,
     ):
         self.agent.new_task(task, extra_args, tool_names)
+
+        if self.agent.long_term_memory:
+            self.agent.long_term_memory.set_task(task)
 
         if self.agent.allow_mcp_servers:
             if self.agent.cli_console:
