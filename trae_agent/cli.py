@@ -50,6 +50,13 @@ def resolve_config_file(config_file: str) -> str:
         return config_file
 
 
+def _generate_session_id() -> str:
+    """Generate a session ID based on the current timestamp."""
+    from datetime import datetime
+
+    return f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+
 def check_docker(timeout=3):
     # 1) Check whether the docker CLI is installed
     if shutil.which("docker") is None:
@@ -195,6 +202,13 @@ def cli():
     default=False,
     help="Extract long-term memory after task execution",
 )
+@click.option(
+    "--memory",
+    "memory_path",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Path to a .md memory file to preload into the session",
+)
 def run(
     task: str | None,
     file_path: str | None,
@@ -211,6 +225,7 @@ def run(
     console_type: str | None = "simple",
     agent_type: str | None = "trae_agent",
     extract_memory: bool = False,
+    memory_path: str | None = None,
     # --- Add Docker Mode ---
     docker_image: str | None = None,
     docker_container_id: str | None = None,
@@ -356,6 +371,8 @@ def run(
         )
         sys.exit(1)
 
+    session_id = _generate_session_id()
+
     agent = Agent(
         agent_type,
         config,
@@ -363,7 +380,12 @@ def run(
         cli_console,
         docker_config=docker_config,
         docker_keep=docker_keep,
+        session_id=session_id,
+        memory_path=memory_path,
     )
+
+    if memory_path and agent.agent.long_term_memory:
+        console.print(f"[cyan]Preloaded memory from: {memory_path}[/cyan]")
 
     if not docker_config:
         try:
@@ -452,6 +474,13 @@ def run(
     help="Type of agent to use (trae_agent)",
     default="trae_agent",
 )
+@click.option(
+    "--memory",
+    "memory_path",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Path to a .md memory file to preload into the session",
+)
 def interactive(
     provider: str | None = None,
     model: str | None = None,
@@ -462,6 +491,7 @@ def interactive(
     trajectory_file: str | None = None,
     console_type: str | None = "simple",
     agent_type: str | None = "trae_agent",
+    memory_path: str | None = None,
 ):
     """
     This function starts an interactive session with Trae Agent.
@@ -507,7 +537,11 @@ def interactive(
         sys.exit(1)
 
     # Create agent
-    agent = Agent(agent_type, config, trajectory_file, cli_console)
+    session_id = _generate_session_id()
+    agent = Agent(agent_type, config, trajectory_file, cli_console, session_id=session_id, memory_path=memory_path)
+
+    if memory_path and agent.agent.long_term_memory:
+        console.print(f"[cyan]Preloaded memory from: {memory_path}[/cyan]")
 
     # Get the actual trajectory file path (in case it was auto-generated)
     trajectory_file = agent.trajectory_file
@@ -873,6 +907,44 @@ def memory(
         console.print(Panel(RichMarkdown(md_content), title="Memory Preview", border_style="cyan"))
     else:
         console.print("[yellow]No memory could be extracted from this trajectory.[/yellow]")
+
+
+@cli.command("memory-list")
+@click.option(
+    "--memory-dir",
+    default="memory/",
+    help="Directory containing memory files and index",
+)
+def memory_list(memory_dir: str):
+    """List session-memory associations from the memory index."""
+    from trae_agent.utils.long_term_memory import LongTermMemory
+
+    index_path = os.path.join(memory_dir, "index.json")
+    index = LongTermMemory.query_index(index_path)
+
+    sessions = index.get("sessions", {})
+    if not sessions:
+        console.print("[yellow]No memory index found or no sessions recorded.[/yellow]")
+        return
+
+    table = Table(title="Memory Index — Session Associations")
+    table.add_column("Session ID", style="cyan")
+    table.add_column("Task Name", style="green")
+    table.add_column("Memory Files", style="magenta")
+    table.add_column("Trajectory File", style="blue")
+    table.add_column("Created At", style="yellow")
+
+    for session_id, entry in sessions.items():
+        memory_files = "\n".join(entry.get("memory_files", []))
+        table.add_row(
+            session_id,
+            entry.get("task_name", "Unknown"),
+            memory_files,
+            entry.get("trajectory_file", ""),
+            entry.get("created_at", ""),
+        )
+
+    console.print(table)
 
 
 def main():

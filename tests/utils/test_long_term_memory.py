@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock
 
 from trae_agent.agent.agent_basics import AgentStep, AgentStepState
@@ -397,3 +398,262 @@ class TestExtractMemory(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMemoryDocumentSessionId(unittest.TestCase):
+    def test_to_markdown_with_session_id(self):
+        doc = MemoryDocument(
+            task_name="Fix login bug",
+            session_id="session_20250101_120000",
+            sections=[
+                MemorySection(step_range="1-3", problem="Login fails", conclusion="Regex issue"),
+            ],
+            created_at="2025-01-01 12:00:00",
+            step_count=3,
+        )
+        md = doc.to_markdown()
+        self.assertIn("Session: session_20250101_120000", md)
+
+    def test_to_markdown_without_session_id(self):
+        doc = MemoryDocument(
+            task_name="Fix login bug",
+            sections=[
+                MemorySection(step_range="1-3", problem="Login fails", conclusion="Regex issue"),
+            ],
+            created_at="2025-01-01 12:00:00",
+            step_count=3,
+        )
+        md = doc.to_markdown()
+        self.assertNotIn("Session:", md)
+
+    def test_from_markdown_with_session_id(self):
+        md = """# Long-term Memory — Task: Fix login bug
+Session: session_20250101_120000
+Generated: 2025-01-01 12:00:00 | Steps: 3
+
+## Step 1-3
+**Problem**: Login fails
+**Conclusion**: Regex issue
+"""
+        doc = MemoryDocument.from_markdown(md)
+        self.assertEqual(doc.session_id, "session_20250101_120000")
+
+    def test_from_markdown_without_session_id(self):
+        md = """# Long-term Memory — Task: Fix login bug
+Generated: 2025-01-01 12:00:00 | Steps: 3
+
+## Step 1-3
+**Problem**: Login fails
+**Conclusion**: Regex issue
+"""
+        doc = MemoryDocument.from_markdown(md)
+        self.assertEqual(doc.session_id, "")
+
+
+class TestLoadMemory(unittest.TestCase):
+    def _make_ltm(self, tmpdir: str) -> LongTermMemory:
+        model = ModelConfig(
+            model="gpt-4o",
+            model_provider=ModelProvider(api_key="test", provider="openai"),
+            max_tokens=4096,
+            temperature=0.5,
+            top_p=1,
+            top_k=0,
+            max_retries=5,
+            parallel_tool_calls=True,
+        )
+        return LongTermMemory(
+            config=LongTermMemoryConfig(enabled=True, output_dir=tmpdir),
+            fallback_model=model,
+        )
+
+    def test_load_memory_populates_preloaded_sections(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ltm = self._make_ltm(tmpdir)
+            # Write a memory file
+            md_path = f"{tmpdir}/test_memory.md"
+            with open(md_path, "w") as f:
+                f.write("# Long-term Memory — Task: Previous task\n\n## Step 1-2\n**Problem**: Old problem\n**Conclusion**: Old conclusion\n")
+            ltm.load_memory(md_path)
+            self.assertEqual(len(ltm._preloaded_sections), 1)
+            self.assertEqual(ltm._preloaded_sections[0].problem, "Old problem")
+
+    def test_load_memory_file_not_found(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ltm = self._make_ltm(tmpdir)
+            with self.assertRaises(FileNotFoundError):
+                ltm.load_memory(f"{tmpdir}/nonexistent.md")
+
+    def test_load_memory_empty_sections(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ltm = self._make_ltm(tmpdir)
+            md_path = f"{tmpdir}/empty.md"
+            with open(md_path, "w") as f:
+                f.write("# Long-term Memory — Task: Empty\n\nNo sections here.\n")
+            ltm.load_memory(md_path)
+            self.assertEqual(len(ltm._preloaded_sections), 0)
+
+    def test_preloaded_sections_survive_set_task(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ltm = self._make_ltm(tmpdir)
+            md_path = f"{tmpdir}/test_memory.md"
+            with open(md_path, "w") as f:
+                f.write("# Long-term Memory — Task: Previous task\n\n## Step 1-2\n**Problem**: Old problem\n**Conclusion**: Old conclusion\n")
+            ltm.load_memory(md_path)
+            ltm._sections = [MemorySection(step_range="1-1", problem="Current", conclusion="Current")]
+            ltm.set_task("New task")
+            self.assertEqual(len(ltm._preloaded_sections), 1)
+            self.assertEqual(len(ltm._sections), 0)
+
+    def test_build_memory_message_combines_both(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ltm = self._make_ltm(tmpdir)
+            md_path = f"{tmpdir}/test_memory.md"
+            with open(md_path, "w") as f:
+                f.write("# Long-term Memory — Task: Previous task\n\n## Step 1-2\n**Problem**: Old problem\n**Conclusion**: Old conclusion\n")
+            ltm.load_memory(md_path)
+            ltm._sections = [MemorySection(step_range="1-1", problem="Current problem", conclusion="Current conclusion")]
+            msg = ltm.build_memory_message()
+            self.assertIsNotNone(msg)
+            self.assertIn("Context from Previous Sessions", msg.content)
+            self.assertIn("Context from Current Session", msg.content)
+            self.assertIn("Old problem", msg.content)
+            self.assertIn("Current problem", msg.content)
+
+
+class TestMemoryIndex(unittest.TestCase):
+    def _make_ltm(self, tmpdir: str) -> LongTermMemory:
+        model = ModelConfig(
+            model="gpt-4o",
+            model_provider=ModelProvider(api_key="test", provider="openai"),
+            max_tokens=4096,
+            temperature=0.5,
+            top_p=1,
+            top_k=0,
+            max_retries=5,
+            parallel_tool_calls=True,
+        )
+        return LongTermMemory(
+            config=LongTermMemoryConfig(enabled=True, output_dir=tmpdir),
+            fallback_model=model,
+        )
+
+    def test_update_index_creates_entry(self):
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ltm = self._make_ltm(tmpdir)
+            ltm.set_session_id("session_test_001")
+            ltm.set_task("Test task")
+            ltm._update_index(f"{tmpdir}/memory_test.md")
+
+            index = json.loads(Path(f"{tmpdir}/index.json").read_text())
+            self.assertIn("session_test_001", index["sessions"])
+            self.assertEqual(index["sessions"]["session_test_001"]["task_name"], "Test task")
+
+    def test_update_index_appends_memory_file(self):
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ltm = self._make_ltm(tmpdir)
+            ltm.set_session_id("session_test_002")
+            ltm.set_task("Test task")
+            ltm._update_index(f"{tmpdir}/memory_1.md")
+            ltm._update_index(f"{tmpdir}/memory_2.md")
+
+            index = json.loads(Path(f"{tmpdir}/index.json").read_text())
+            self.assertEqual(len(index["sessions"]["session_test_002"]["memory_files"]), 2)
+
+    def test_query_index_empty(self):
+        result = LongTermMemory.query_index("/nonexistent/path/index.json")
+        self.assertEqual(result, {"version": 1, "sessions": {}})
+
+    def test_set_trajectory_file(self):
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ltm = self._make_ltm(tmpdir)
+            ltm.set_session_id("session_test_003")
+            ltm.set_task("Test task")
+            ltm._update_index(f"{tmpdir}/memory_test.md")
+            ltm.set_trajectory_file("trajectories/trajectory_test.json")
+
+            index = json.loads(Path(f"{tmpdir}/index.json").read_text())
+            self.assertEqual(
+                index["sessions"]["session_test_003"]["trajectory_file"],
+                "trajectories/trajectory_test.json",
+            )
+
+
+class TestCrossSessionIntegration(unittest.TestCase):
+    def test_save_and_reload_memory(self):
+        import asyncio
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # First session: extract and save
+            model = ModelConfig(
+                model="gpt-4o",
+                model_provider=ModelProvider(api_key="test", provider="openai"),
+                max_tokens=4096,
+                temperature=0.5,
+                top_p=1,
+                top_k=0,
+                max_retries=5,
+                parallel_tool_calls=True,
+            )
+            ltm1 = LongTermMemory(
+                config=LongTermMemoryConfig(enabled=True, output_dir=tmpdir),
+                fallback_model=model,
+            )
+            ltm1.set_session_id("session_first")
+            ltm1.set_task("First task")
+
+            mock_response = LLMResponse(
+                content='<group steps="1-2">\n<problem>First problem</problem>\n<conclusion>First conclusion</conclusion>\n</group>',
+                model="gpt-4o",
+            )
+            ltm1._llm_client = MagicMock()
+            ltm1._llm_client.chat = MagicMock(return_value=mock_response)
+
+            steps = [
+                AgentStep(
+                    step_number=1,
+                    state=AgentStepState.COMPLETED,
+                    llm_response=LLMResponse(content="Step 1", model="gpt-4o"),
+                ),
+            ]
+
+            path = asyncio.run(ltm1.extract_and_save(steps))
+            self.assertIsNotNone(path)
+
+            # Second session: load the memory
+            ltm2 = LongTermMemory(
+                config=LongTermMemoryConfig(enabled=True, output_dir=tmpdir),
+                fallback_model=model,
+            )
+            ltm2.set_session_id("session_second")
+            ltm2.set_task("Second task")
+            ltm2.load_memory(path)
+
+            self.assertEqual(len(ltm2._preloaded_sections), 1)
+            self.assertEqual(ltm2._preloaded_sections[0].problem, "First problem")
+
+            # Verify build_memory_message includes both
+            ltm2._sections = [MemorySection(step_range="1-1", problem="New problem", conclusion="New conclusion")]
+            msg = ltm2.build_memory_message()
+            self.assertIn("First problem", msg.content)
+            self.assertIn("New problem", msg.content)

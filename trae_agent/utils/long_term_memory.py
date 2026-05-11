@@ -3,6 +3,7 @@
 
 """Long-term memory extraction and visualization for trae-agent."""
 
+import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -53,6 +54,7 @@ class MemoryDocument:
     """A complete memory document extracted from agent execution."""
 
     task_name: str
+    session_id: str = ""
     sections: list[MemorySection] = field(default_factory=list)
     created_at: str = ""
     step_count: int = 0
@@ -60,6 +62,9 @@ class MemoryDocument:
     def to_markdown(self) -> str:
         """Render the full document as Markdown."""
         lines = [f"# Long-term Memory — Task: {self.task_name}", ""]
+        if self.session_id:
+            lines.append(f"Session: {self.session_id}")
+            lines.append("")
         if self.created_at:
             lines.append(f"Generated: {self.created_at} | Steps: {self.step_count}")
             lines.append("")
@@ -76,6 +81,9 @@ class MemoryDocument:
         task_match = re.search(r"# Long-term Memory — Task: (.+)", markdown_text)
         task_name = task_match.group(1).strip() if task_match else "Unknown"
 
+        session_match = re.search(r"^Session: (.+)$", markdown_text, re.MULTILINE)
+        session_id = session_match.group(1).strip() if session_match else ""
+
         sections: list[MemorySection] = []
         # Match ## Step N-M blocks
         section_pattern = re.compile(
@@ -90,7 +98,7 @@ class MemoryDocument:
                 )
             )
 
-        return cls(task_name=task_name, sections=sections)
+        return cls(task_name=task_name, session_id=session_id, sections=sections)
 
 
 class LongTermMemory:
@@ -104,6 +112,8 @@ class LongTermMemory:
         self._model_config: ModelConfig = model
         self._config = config
         self._sections: list[MemorySection] = []
+        self._preloaded_sections: list[MemorySection] = []
+        self._session_id: str = ""
         self._output_dir = Path(config.output_dir)
         self._output_dir.mkdir(parents=True, exist_ok=True)
         self._task_name: str = ""
@@ -112,6 +122,24 @@ class LongTermMemory:
         """Called at task start."""
         self._task_name = task_name
         self._sections = []
+
+    def set_session_id(self, session_id: str) -> None:
+        """Set the session ID for this memory instance."""
+        self._session_id = session_id
+
+    def load_memory(self, path: str) -> None:
+        """Load memory sections from a previously saved .md file.
+
+        The loaded sections are stored in _preloaded_sections and persist
+        across set_task() calls, providing cross-session context.
+        """
+        filepath = Path(path)
+        if not filepath.exists():
+            raise FileNotFoundError(f"Memory file not found: {path}")
+        markdown_text = filepath.read_text(encoding="utf-8")
+        doc = MemoryDocument.from_markdown(markdown_text)
+        if doc.sections:
+            self._preloaded_sections = doc.sections
 
     def _agent_step_str(self, agent_step: AgentStep) -> str | None:
         """Convert an AgentStep to a string for the LLM."""
@@ -216,21 +244,87 @@ class LongTermMemory:
         if doc is None:
             return None
         self._sections = doc.sections
+        doc.session_id = self._session_id
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"memory_{timestamp}.md"
         filepath = self._output_dir / filename
         filepath.write_text(doc.to_markdown(), encoding="utf-8")
+        self._update_index(str(filepath))
         return str(filepath)
 
     def build_memory_message(self) -> LLMMessage | None:
         """Build an LLMMessage containing the compressed memory summary."""
-        if not self._sections:
+        all_sections = self._preloaded_sections + self._sections
+        if not all_sections:
             return None
         content = "# Long-term Memory Summary\n\n"
         content += "The following is a compressed summary of the agent's previous execution. "
         content += "Use this as context instead of the full conversation history.\n\n"
-        for section in self._sections:
-            content += f"## {section.heading()}\n"
-            content += f"**Problem**: {section.problem}\n"
-            content += f"**Conclusion**: {section.conclusion}\n\n"
+        if self._preloaded_sections:
+            content += "## Context from Previous Sessions\n\n"
+            for section in self._preloaded_sections:
+                content += f"### {section.heading()}\n"
+                content += f"**Problem**: {section.problem}\n"
+                content += f"**Conclusion**: {section.conclusion}\n\n"
+        if self._sections:
+            content += "## Context from Current Session\n\n"
+            for section in self._sections:
+                content += f"### {section.heading()}\n"
+                content += f"**Problem**: {section.problem}\n"
+                content += f"**Conclusion**: {section.conclusion}\n\n"
         return LLMMessage(role="user", content=content)
+
+    # --- Memory index management ---
+
+    def _index_path(self) -> Path:
+        """Return the path to the memory index file."""
+        return self._output_dir / "index.json"
+
+    def _load_index(self) -> dict:
+        """Load the memory index from disk, or return empty structure."""
+        path = self._index_path()
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+        return {"version": 1, "sessions": {}}
+
+    def _save_index(self, index: dict) -> None:
+        """Save the memory index to disk."""
+        path = self._index_path()
+        path.write_text(json.dumps(index, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def _update_index(self, memory_file_path: str) -> None:
+        """Update the index with the current session's memory file."""
+        if not self._session_id:
+            return
+        index = self._load_index()
+        sessions = index["sessions"]
+        if self._session_id not in sessions:
+            sessions[self._session_id] = {
+                "task_name": self._task_name,
+                "memory_files": [memory_file_path],
+                "trajectory_file": "",
+                "created_at": datetime.now().isoformat(),
+            }
+        else:
+            entry = sessions[self._session_id]
+            if memory_file_path not in entry["memory_files"]:
+                entry["memory_files"].append(memory_file_path)
+        self._save_index(index)
+
+    def set_trajectory_file(self, trajectory_file: str) -> None:
+        """Record the trajectory file path for this session in the index."""
+        if not self._session_id:
+            return
+        index = self._load_index()
+        sessions = index["sessions"]
+        if self._session_id in sessions:
+            sessions[self._session_id]["trajectory_file"] = trajectory_file
+        self._save_index(index)
+
+    @classmethod
+    def query_index(cls, index_path: str) -> dict:
+        """Read and return the memory index. Used by CLI commands."""
+        path = Path(index_path)
+        if not path.exists():
+            return {"version": 1, "sessions": {}}
+        return json.loads(path.read_text(encoding="utf-8"))
